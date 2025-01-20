@@ -8,7 +8,7 @@ use crate::core::uad_lists::{
     load_debloat_lists, Opposite, PackageHashMap, PackageState, Removal, UadList, UadListState,
 };
 use crate::core::utils::{
-    export_selection, fetch_packages, open_url, ANDROID_SERIAL, EXPORT_FILE_NAME,
+    export_selection, fetch_packages, open_url, ANDROID_SERIAL, EXPORT_FILE_NAME, NAME,
 };
 use crate::gui::style;
 use crate::gui::widgets::navigation_menu::ICONS;
@@ -44,16 +44,20 @@ pub enum LoadingState {
 }
 
 #[derive(Default, Debug, Clone)]
+#[allow(clippy::struct_excessive_bools, reason = "Not a state-machine")]
 pub struct List {
     pub loading_state: LoadingState,
     pub uad_lists: PackageHashMap,
-    pub phone_packages: Vec<Vec<PackageRow>>, // packages of all users of the phone
-    filtered_packages: Vec<usize>, // phone_packages indexes of the selected user (= what you see on screen)
-    selected_packages: Vec<(usize, usize)>, // Vec of (user_index, pkg_index)
+    /// packages of all users of the phone
+    pub phone_packages: Vec<Vec<PackageRow>>,
+    /// `phone_packages` indexes of the selected user (= what you see on screen)
+    filtered_packages: Vec<usize>,
+    /// Vec of `(user_index, pkg_index)`
+    selected_packages: Vec<(usize, usize)>,
     selected_package_state: Option<PackageState>,
     selected_removal: Option<Removal>,
     selected_list: Option<UadList>,
-    selected_user: Option<User>,
+    pub selected_user: Option<User>,
     all_selected: bool,
     pub input_value: String,
     description: String,
@@ -108,6 +112,8 @@ impl From<Removal> for SummaryEntry {
 }
 
 impl List {
+    // TODO: refactor later
+    #[allow(clippy::too_many_lines)]
     pub fn update(
         &mut self,
         settings: &mut Settings,
@@ -163,8 +169,7 @@ impl List {
                     Message::LoadPhonePackages,
                 )
             }
-            Message::LoadPhonePackages(list_box) => {
-                let (uad_list, list_state) = list_box;
+            Message::LoadPhonePackages((uad_list, list_state)) => {
                 self.loading_state = LoadingState::LoadingPackages;
                 self.uad_lists.clone_from(&uad_list);
                 *list_update_state = list_state;
@@ -220,7 +225,8 @@ impl List {
                 Command::none()
             }
             Message::List(i_package, row_message) => {
-                #[allow(unused_must_use)]
+                #[expect(unused_must_use, reason = "side-effect")]
+                #[expect(clippy::shadow_unrelated, reason = "same-type")]
                 {
                     self.phone_packages[i_user][i_package]
                         .update(&row_message)
@@ -352,7 +358,7 @@ impl List {
     ) -> Element<Message, Theme, Renderer> {
         match &self.loading_state {
             LoadingState::DownloadingList => waiting_view(
-                "Downloading latest UAD-ng lists from GitHub. Please wait...",
+                &format!("Downloading latest {NAME} lists from GitHub. Please wait..."),
                 Some(button("No internet?").on_press(Message::LoadUadList(false))),
                 style::Text::Default,
             ),
@@ -376,7 +382,7 @@ impl List {
                 style::Text::Default,
             ),
             LoadingState::_UpdatingUad => waiting_view(
-                "Updating UAD-ng. Please wait...",
+                &format!("Updating {NAME}. Please wait..."),
                 None,
                 style::Text::Default,
             ),
@@ -453,6 +459,8 @@ impl List {
         .into()
     }
 
+    // TODO: refactor later
+    #[allow(clippy::too_many_lines)]
     fn ready_view(
         &self,
         settings: &Settings,
@@ -463,7 +471,7 @@ impl List {
             .iter()
             .fold(column![].spacing(6), |col, &i| {
                 col.push(
-                    self.phone_packages[self.selected_user.unwrap().index][i]
+                    self.phone_packages[self.selected_user.unwrap_or_default().index][i]
                         .view(settings, selected_device)
                         .map(move |msg| Message::List(i, msg)),
                 )
@@ -482,35 +490,30 @@ impl List {
             .width(Length::Fill)
             .style(style::Container::Frame);
 
-        let review_selection = if !self.selected_packages.is_empty() {
-            button_primary(text(format!(
+        let review_selection = {
+            let tmp_widget = text(format!(
                 "Review selection ({})",
                 self.selected_packages.len()
-            )))
-            .on_press(Message::ApplyActionOnSelection)
-        } else {
-            button(text(format!(
-                "Review selection ({})",
-                self.selected_packages.len()
-            )))
-            .padding([5, 10])
+            ));
+            if self.selected_packages.is_empty() {
+                button(tmp_widget).padding([5, 10])
+            } else {
+                button_primary(tmp_widget).on_press(Message::ApplyActionOnSelection)
+            }
         };
 
-        let export_selection = if !self.selected_packages.is_empty() {
-            button(text(format!(
-                "Export current selection ({})",
-                self.selected_packages.len()
-            )))
-            .on_press(Message::ExportSelection)
-            .padding([5, 10])
-            .style(style::Button::Primary)
-        } else {
-            button(text(format!(
-                "Export current selection ({})",
-                self.selected_packages.len()
-            )))
-            .padding([5, 10])
+        let mut export_selection = button(text(format!(
+            "Export current selection ({})",
+            self.selected_packages.len()
+        )))
+        .padding([5, 10]);
+        if !self.selected_packages.is_empty() {
+            export_selection = export_selection
+                .on_press(Message::ExportSelection)
+                .style(style::Button::Primary);
         };
+        // lock
+        let export_selection = export_selection;
 
         let action_row = row![
             export_selection,
@@ -538,8 +541,15 @@ impl List {
 
         let control_panel = self.control_panel(selected_device);
         let content = if selected_device.user_list.is_empty()
-            || !self.phone_packages[self.selected_user.unwrap().index].is_empty()
-        {
+            || match self.selected_user {
+                Some(u) => !self.phone_packages[u.index].is_empty(),
+                // If no user has been selected,
+                // then it could be considered as "equivalent"
+                // to the case where the `user_list` is empty?
+                // However, this is inconsistent,
+                // because other parts of the code simply use a `default` `User`.
+                None => true,
+            } {
             column![
                 control_panel,
                 packages_scrollable,
@@ -562,7 +572,7 @@ impl List {
                 self.apply_selection_modal(
                     selected_device,
                     settings,
-                    &self.phone_packages[self.selected_user.unwrap().index],
+                    &self.phone_packages[self.selected_user.unwrap_or_default().index],
                 ),
             )
             .on_blur(Message::ModalHide)
@@ -578,7 +588,7 @@ impl List {
                 .center_x();
 
             let text_box = row![
-                text("Exported current selection into file.\nFile is exported in same directory where UAD-ng is located.").width(Length::Fill),
+                text(format!("Exported current selection into file.\nFile is exported in same directory where {NAME} is located.")).width(Length::Fill),
             ].padding(20);
 
             let file_row = row![text(EXPORT_FILE_NAME).style(style::Text::Commentary)].padding(20);
@@ -609,12 +619,16 @@ impl List {
         }
     }
 
+    // TODO: refactor later
+    #[allow(clippy::too_many_lines)]
     fn apply_selection_modal(
         &self,
         device: &Phone,
         settings: &Settings,
         packages: &[PackageRow],
     ) -> Element<Message, Theme, Renderer> {
+        const PACK_NO_USER_MSG: &str = "`selected_packages` implies a user must be selected";
+
         // 5 element slice is cheap
         let mut summaries = Removal::CATEGORIES.map(SummaryEntry::from);
         for p in packages.iter().filter(|p| p.selected) {
@@ -695,18 +709,16 @@ impl List {
             container(
                 scrollable(
                     container(
-                        if !self
+                        if self
                             .selected_packages
                             .iter()
-                            .any(|s| s.0 == self.selected_user.unwrap().index)
+                            .any(|s| s.0 == self.selected_user.expect(PACK_NO_USER_MSG).index)
                         {
-                            column![text("No packages selected for this user")]
-                                .align_items(Alignment::Center)
-                                .width(Length::Fill)
-                        } else {
                             self.selected_packages
                                 .iter()
-                                .filter(|s| s.0 == self.selected_user.unwrap().index)
+                                .filter(|s| {
+                                    s.0 == self.selected_user.expect(PACK_NO_USER_MSG).index
+                                })
                                 .fold(
                                     column![].spacing(6).width(Length::Fill),
                                     |col, selection| {
@@ -755,6 +767,10 @@ impl List {
                                         )
                                     },
                                 )
+                        } else {
+                            column![text("No packages selected for this user")]
+                                .align_items(Alignment::Center)
+                                .width(Length::Fill)
                         },
                     )
                     .padding(10)
@@ -811,12 +827,19 @@ impl List {
         .into()
     }
     fn filter_package_lists(&mut self) {
-        let list_filter: UadList = self.selected_list.unwrap();
-        let package_filter: PackageState = self.selected_package_state.unwrap();
-        let removal_filter: Removal = self.selected_removal.unwrap();
+        let list_filter: UadList = self.selected_list.expect("UAD-list type must be selected");
+        let package_filter: PackageState = self
+            .selected_package_state
+            .expect("pack-state must be selected");
+        let removal_filter: Removal = self
+            .selected_removal
+            .expect("removal recommendation must be selected");
 
-        self.filtered_packages = self.phone_packages[self.selected_user.unwrap().index]
+        self.filtered_packages = self.phone_packages
+            [self.selected_user.expect("User must be selected").index]
             .iter()
+            // we must filter the indices associated with pack-rows,
+            // that's why `enumerate` is before `filter`.
             .enumerate()
             .filter(|(_, p)| {
                 (list_filter == UadList::All || p.uad_list == list_filter)
@@ -827,7 +850,7 @@ impl List {
             .map(|(i, _)| i)
             .collect();
     }
-
+    #[expect(clippy::unused_async, reason = "1 call-site")]
     async fn load_packages(uad_list: PackageHashMap, user_list: Vec<User>) -> Vec<Vec<PackageRow>> {
         if user_list.len() <= 1 {
             vec![fetch_packages(&uad_list, None)]
@@ -839,8 +862,9 @@ impl List {
         }
     }
 
+    #[expect(clippy::unused_async, reason = "1 call-site")]
     async fn init_apps_view(remote: bool, phone: Phone) -> (PackageHashMap, UadListState) {
-        let (uad_lists, _) = load_debloat_lists(remote);
+        let uad_lists = load_debloat_lists(remote);
         match uad_lists {
             Ok(list) => {
                 env::set_var(ANDROID_SERIAL, phone.adb_id.clone());
