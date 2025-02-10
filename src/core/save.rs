@@ -4,31 +4,32 @@ use crate::core::utils::DisplayablePath;
 use crate::gui::widgets::package_row::PackageRow;
 use crate::CACHE_DIR;
 use serde::{Deserialize, Serialize};
-use static_init::dynamic;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-#[dynamic]
-pub static BACKUP_DIR: PathBuf = CACHE_DIR.join("backups");
+pub static BACKUP_DIR: LazyLock<PathBuf> = LazyLock::new(|| CACHE_DIR.join("backups"));
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-struct PhoneBackup {
-    device_id: String,
-    users: Vec<UserBackup>,
+pub struct PhoneBackup {
+    pub device_id: String,
+    pub users: Vec<UserBackup>,
 }
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-struct UserBackup {
-    id: u16,
-    packages: Vec<CorePackage>,
+pub struct UserBackup {
+    pub id: u16,
+    pub packages: Vec<CorePackage>,
 }
 
-// Backup all `Uninstalled` and `Disabled` packages
+/// Backup all `Uninstalled` and `Disabled` packages
 pub async fn backup_phone(
     users: Vec<User>,
     device_id: String,
     phone_packages: Vec<Vec<PackageRow>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut backup = PhoneBackup {
         device_id: device_id.clone(),
         ..PhoneBackup::default()
@@ -63,7 +64,7 @@ pub async fn backup_phone(
                 format!("{}.json", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
 
             match fs::write(backup_path.join(backup_filename), json) {
-                Ok(_) => Ok(()),
+                Ok(()) => Ok(true),
                 Err(err) => Err(err.to_string()),
             }
         }
@@ -75,7 +76,7 @@ pub fn list_available_backups(dir: &Path) -> Vec<DisplayablePath> {
     #[allow(clippy::option_if_let_else)]
     match fs::read_dir(dir) {
         Ok(files) => files
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| DisplayablePath { path: e.path() })
             .collect::<Vec<_>>(),
         Err(_) => vec![],
@@ -153,7 +154,7 @@ pub fn restore_backup(
                     let p_commands = apply_pkg_state_commands(
                         &package,
                         backup_package.state,
-                        &settings
+                        settings
                             .backup
                             .selected_user
                             .ok_or("field should be Some type")?,
