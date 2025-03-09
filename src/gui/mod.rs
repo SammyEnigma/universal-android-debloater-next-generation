@@ -2,11 +2,12 @@ pub mod style;
 pub mod views;
 pub mod widgets;
 
-use crate::core::sync::{get_devices_list, initial_load, perform_adb_commands, CommandType, Phone};
-use crate::core::theme::Theme;
+use crate::core::adb;
+use crate::core::sync::{Phone, get_devices_list, initial_load};
+use crate::core::theme::{OS_COLOR_SCHEME, Theme};
 use crate::core::uad_lists::UadListState;
-use crate::core::update::{get_latest_release, Release, SelfUpdateState, SelfUpdateStatus};
-use crate::core::utils::{string_to_theme, ANDROID_SERIAL};
+use crate::core::update::{Release, SelfUpdateState, SelfUpdateStatus, get_latest_release};
+use crate::core::utils::{NAME, string_to_theme};
 
 use iced::advanced::graphics::image::image_rs::ImageFormat;
 use iced::font;
@@ -18,10 +19,9 @@ use widgets::navigation_menu::nav_menu;
 
 use iced::widget::column;
 use iced::{
-    window::Settings as Window, Alignment, Application, Command, Element, Length, Renderer,
-    Settings,
+    Alignment, Application, Command, Element, Length, Renderer, Settings,
+    window::Settings as Window,
 };
-use std::env;
 #[cfg(feature = "self-update")]
 use std::path::PathBuf;
 
@@ -49,7 +49,8 @@ pub struct UadGui {
     about_view: AboutView,
     settings_view: SettingsView,
     devices_list: Vec<Phone>,
-    selected_device: Option<Phone>, // index of devices_list
+    /// index of `devices_list`
+    selected_device: Option<Phone>,
     update_state: UpdateState,
     nb_running_async_adb_commands: u32,
     adb_satisfied: bool,
@@ -57,7 +58,7 @@ pub struct UadGui {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    // Navigation Panel
+    /// Navigation Panel
     AboutPressed,
     SettingsPressed,
     AppsPress,
@@ -106,9 +107,9 @@ impl Application for UadGui {
     fn title(&self) -> String {
         String::from("Universal Android Debloater Next Generation")
     }
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Message) -> Command<Message> {
         match msg {
-            #[allow(clippy::option_if_let_else)]
             Message::LoadDevices(devices_list) => {
                 self.selected_device = match &self.selected_device {
                     Some(s_device) => {
@@ -122,7 +123,7 @@ impl Application for UadGui {
                 };
                 self.devices_list = devices_list;
 
-                #[allow(unused_must_use)]
+                #[expect(unused_must_use, reason = "side-effect")]
                 {
                     self.update(Message::SettingsAction(SettingsMessage::LoadDeviceSettings));
                 }
@@ -147,7 +148,7 @@ impl Application for UadGui {
             }
             Message::RefreshButtonPressed => {
                 self.apps_view = AppsView::default();
-                #[allow(unused_must_use)]
+                #[expect(unused_must_use, reason = "side-effect")]
                 {
                     self.update(Message::AppsAction(AppsMessage::ADBSatisfied(
                         self.adb_satisfied,
@@ -157,10 +158,14 @@ impl Application for UadGui {
             }
             Message::RebootButtonPressed => {
                 self.apps_view = AppsView::default();
+                let serial = match &self.selected_device {
+                    Some(d) => d.adb_id.clone(),
+                    _ => String::default(),
+                };
                 self.selected_device = None;
                 self.devices_list = vec![];
                 Command::perform(
-                    perform_adb_commands("reboot".to_string(), CommandType::Shell),
+                    async { adb::ACommand::new().shell(serial).reboot() },
                     |_| Message::Nothing,
                 )
             }
@@ -179,7 +184,7 @@ impl Application for UadGui {
                         self.nb_running_async_adb_commands -= 1;
                         self.view = View::List;
 
-                        #[allow(unused_must_use)]
+                        #[expect(unused_must_use, reason = "side-effect")]
                         {
                             self.apps_view.update(
                                 &mut self.settings_view,
@@ -192,22 +197,18 @@ impl Application for UadGui {
                             return self.update(Message::RefreshButtonPressed);
                         }
                     }
-                    SettingsMessage::MultiUserMode(toggled) => {
-                        if toggled {
-                            for user in self.apps_view.phone_packages.clone() {
-                                for (i, _) in
-                                    user.iter().enumerate().filter(|&(_, pkg)| pkg.selected)
+                    SettingsMessage::MultiUserMode(toggled) if toggled => {
+                        for user in self.apps_view.phone_packages.clone() {
+                            for (i, _) in user.iter().filter(|&pkg| pkg.selected).enumerate() {
+                                for u in self
+                                    .selected_device
+                                    .as_ref()
+                                    .expect("Device should be selected")
+                                    .user_list
+                                    .iter()
+                                    .filter(|&u| !u.protected)
                                 {
-                                    for u in self
-                                        .selected_device
-                                        .as_ref()
-                                        .unwrap()
-                                        .user_list
-                                        .iter()
-                                        .filter(|&u| !u.protected)
-                                    {
-                                        self.apps_view.phone_packages[u.index][i].selected = true;
-                                    }
+                                    self.apps_view.phone_packages[u.index][i].selected = true;
                                 }
                             }
                         }
@@ -220,6 +221,7 @@ impl Application for UadGui {
                         &self.apps_view.phone_packages,
                         &mut self.nb_running_async_adb_commands,
                         msg,
+                        self.apps_view.selected_user,
                     )
                     .map(Message::SettingsAction)
             }
@@ -234,19 +236,13 @@ impl Application for UadGui {
                     }
                     AboutMessage::DoSelfUpdate => {
                         #[cfg(feature = "self-update")]
-                        if self.update_state.self_update.latest_release.is_some() {
+                        if let Some(release) = self.update_state.self_update.latest_release.as_ref()
+                        {
                             self.update_state.self_update.status = SelfUpdateStatus::Updating;
                             self.apps_view.loading_state = ListLoadingState::_UpdatingUad;
                             let bin_name = bin_name().to_owned();
-                            let release = self
-                                .update_state
-                                .self_update
-                                .latest_release
-                                .as_ref()
-                                .unwrap()
-                                .clone();
                             Command::perform(
-                                download_update_to_temp_file(bin_name, release),
+                                download_update_to_temp_file(bin_name, release.clone()),
                                 Message::_NewReleaseDownloaded,
                             )
                         } else {
@@ -261,7 +257,6 @@ impl Application for UadGui {
             Message::DeviceSelected(s_device) => {
                 self.selected_device = Some(s_device.clone());
                 self.view = View::List;
-                env::set_var(ANDROID_SERIAL, s_device.adb_id);
                 info!("{:-^65}", "-");
                 info!(
                     "ANDROID_SDK: {} | DEVICE: {}",
@@ -270,7 +265,7 @@ impl Application for UadGui {
                 info!("{:-^65}", "-");
                 self.apps_view.loading_state = ListLoadingState::FindingPhones;
 
-                #[allow(unused_must_use)]
+                #[expect(unused_must_use, reason = "side-effects")]
                 {
                     self.update(Message::SettingsAction(SettingsMessage::LoadDeviceSettings));
                     self.update(Message::AppsAction(AppsMessage::ToggleAllSelected(false)));
@@ -283,14 +278,10 @@ impl Application for UadGui {
             }
             #[cfg(feature = "self-update")]
             Message::_NewReleaseDownloaded(res) => {
-                debug!("UAD-ng update has been downloaded!");
+                debug!("{NAME} update has been downloaded!");
 
                 if let Ok((relaunch_path, cleanup_path)) = res {
-                    // Remove first arg, which is path to binary. We don't use this first
-                    // arg as binary path because it's not reliable, per the docs.
-                    let mut args = std::env::args();
-                    args.next();
-                    let mut args: Vec<_> = args.collect();
+                    let mut args: Vec<_> = std::env::args().skip(1).collect();
 
                     // Remove the `--self-update-temp` arg from args if it exists,
                     // since we need to pass it cleanly. Otherwise new process will
@@ -317,12 +308,12 @@ impl Application for UadGui {
                             if let Err(e) = remove_file(cleanup_path) {
                                 error!("Could not remove temp update file: {}", e);
                             }
-                            error!("Failed to update UAD-ng: {}", error);
+                            error!("Failed to update {NAME}: {}", error);
                         }
                     }
                 } else {
-                    error!("Failed to update UAD-ng!");
-                    #[allow(unused_must_use)]
+                    error!("Failed to update {NAME}!");
+                    #[expect(unused_must_use, reason = "side-effect")]
                     {
                         self.update(Message::AppsAction(AppsMessage::UpdateFailed));
                         self.update_state.self_update.status = SelfUpdateStatus::Failed;
@@ -336,7 +327,7 @@ impl Application for UadGui {
                         self.update_state.self_update.status = SelfUpdateStatus::Done;
                         self.update_state.self_update.latest_release = r;
                     }
-                    Err(_) => self.update_state.self_update.status = SelfUpdateStatus::Failed,
+                    Err(()) => self.update_state.self_update.status = SelfUpdateStatus::Failed,
                 };
                 Command::none()
             }
@@ -377,7 +368,7 @@ impl Application for UadGui {
                 .map(Message::AboutAction),
             View::Settings => self
                 .settings_view
-                .view(&selected_device)
+                .view(&selected_device, &self.apps_view)
                 .map(Message::SettingsAction),
         };
 
@@ -390,13 +381,18 @@ impl Application for UadGui {
 
 impl UadGui {
     pub fn start() -> iced::Result {
-        let logo: &[u8] = match dark_light::detect() {
-            dark_light::Mode::Dark => include_bytes!("../../resources/assets/logo-dark.png"),
-            dark_light::Mode::Light => include_bytes!("../../resources/assets/logo-light.png"),
-            dark_light::Mode::Default => include_bytes!("../../resources/assets/logo-light.png"),
+        let logo: &[u8] = match *OS_COLOR_SCHEME {
+            // remember to keep `Unspecified` in sync with `src/core/theme`
+            dark_light::Mode::Dark | dark_light::Mode::Unspecified => {
+                include_bytes!("../../resources/assets/logo-dark.png")
+            }
+            dark_light::Mode::Light => {
+                include_bytes!("../../resources/assets/logo-light.png")
+            }
         };
 
         Self::run(Settings {
+            id: Some(String::from(NAME)),
             window: Window {
                 size: iced::Size {
                     width: 950.0,

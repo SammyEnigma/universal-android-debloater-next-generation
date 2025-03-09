@@ -1,7 +1,7 @@
 use iced::advanced::widget::{self, Tree, Widget};
-use iced::advanced::{layout, overlay, renderer, Clipboard, Layout, Shell};
+use iced::advanced::{Clipboard, Layout, Shell, layout, overlay, renderer};
 use iced::mouse::{self, Cursor};
-use iced::{advanced, event, Alignment, Color, Element, Event, Length, Point, Rectangle, Size};
+use iced::{Alignment, Color, Element, Event, Length, Point, Rectangle, Size, advanced, event};
 
 /// A widget that centers a modal element over some base element
 pub struct Modal<'a, Message, Theme, Renderer> {
@@ -23,7 +23,6 @@ impl<'a, Message, Theme, Renderer> Modal<'a, Message, Theme, Renderer> {
         }
     }
 
-    #[allow(clippy::missing_const_for_fn)]
     /// Sets the message that will be produces when the background
     /// of the [`Modal`] is pressed
     pub fn on_blur(self, on_blur: Message) -> Self {
@@ -34,8 +33,8 @@ impl<'a, Message, Theme, Renderer> Modal<'a, Message, Theme, Renderer> {
     }
 }
 
-impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
-    for Modal<'a, Message, Theme, Renderer>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for Modal<'_, Message, Theme, Renderer>
 where
     Renderer: advanced::Renderer,
     Message: Clone,
@@ -72,7 +71,7 @@ where
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) -> event::Status {
         self.base.as_widget_mut().on_event(
             &mut state.children[0],
@@ -82,7 +81,7 @@ where
             renderer,
             clipboard,
             shell,
-            _viewport,
+            viewport,
         )
     }
 
@@ -161,8 +160,8 @@ struct Overlay<'a, 'b, Message, Theme, Renderer> {
     on_blur: Option<Message>,
 }
 
-impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
-    for Overlay<'a, 'b, Message, Theme, Renderer>
+impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
+    for Overlay<'_, '_, Message, Theme, Renderer>
 where
     Renderer: advanced::Renderer,
     Message: Clone,
@@ -190,12 +189,17 @@ where
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) -> event::Status {
-        let content_bounds = layout.children().next().unwrap().bounds();
-
-        #[allow(clippy::equatable_if_let)]
         if let Some(message) = self.on_blur.as_ref() {
-            if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = &event {
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            ) {
                 if let Some(cursor_position) = cursor.position() {
+                    let content_bounds = layout
+                        .children()
+                        .next()
+                        .expect("Layout must have at least 1 child")
+                        .bounds();
                     if !content_bounds.contains(cursor_position) {
                         shell.publish(message.clone());
                         return event::Status::Captured;

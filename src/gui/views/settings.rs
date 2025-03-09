@@ -1,31 +1,39 @@
-use crate::core::helpers::button_primary;
-use crate::core::sync::AdbError;
-
-use crate::core::config::{BackupSettings, Config, DeviceSettings, GeneralSettings};
-use crate::core::save::{
-    backup_phone, list_available_backup_user, list_available_backups, restore_backup,
+use crate::core::{
+    config::{BackupSettings, Config, DeviceSettings, GeneralSettings},
+    helpers::button_primary,
+    save::{backup_phone, list_available_backup_user, list_available_backups, restore_backup},
+    sync::{
+        AdbError, CommandType, Phone, User, adb_shell_command, get_android_sdk, supports_multi_user,
+    },
+    theme::Theme,
+    utils::{
+        DisplayablePath, Error, NAME, export_packages, generate_backup_name, open_folder, open_url,
+        string_to_theme,
+    },
 };
-use crate::core::sync::{get_android_sdk, perform_adb_commands, CommandType, Phone};
-use crate::core::theme::Theme;
-use crate::core::utils::{open_folder, open_url, string_to_theme, DisplayablePath};
-use crate::gui::style;
-use crate::gui::views::list::PackageInfo;
-use crate::gui::widgets::navigation_menu::ICONS;
-use crate::gui::widgets::package_row::PackageRow;
-
-use iced::widget::{
-    button, checkbox, column, container, pick_list, radio, row, scrollable, text, Space, Text,
+use crate::gui::{
+    style,
+    views::list::{List as AppsView, PackageInfo},
+    widgets::modal::Modal,
+    widgets::navigation_menu::ICONS,
+    widgets::package_row::PackageRow,
+    widgets::text,
 };
-use iced::{alignment, Alignment, Command, Element, Length, Renderer};
+use iced::widget::{Space, button, checkbox, column, container, pick_list, radio, row, scrollable};
+use iced::{Alignment, Element, Length, Renderer, alignment};
 use std::path::PathBuf;
 
-use crate::core::utils::Error;
+#[derive(Debug, Clone)]
+pub enum PopUpModal {
+    ExportUninstalled,
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub general: GeneralSettings,
     pub device: DeviceSettings,
     is_loading: bool,
+    modal: Option<PopUpModal>,
 }
 
 impl Default for Settings {
@@ -34,6 +42,7 @@ impl Default for Settings {
             general: Config::load_configuration_file().general,
             device: DeviceSettings::default(),
             is_loading: false,
+            modal: None,
         }
     }
 }
@@ -50,25 +59,34 @@ pub enum Message {
     BackupDevice,
     RestoreDevice,
     RestoringDevice(Result<CommandType, AdbError>),
-    DeviceBackedUp(Result<(), String>),
+    DeviceBackedUp(Result<bool, String>),
     ChooseBackUpFolder,
     FolderChosen(Result<PathBuf, Error>),
+    ExportPackages,
+    PackagesExported(Result<bool, String>),
+    ModalHide,
 }
 
 impl Settings {
+    #[allow(clippy::too_many_lines)]
     pub fn update(
         &mut self,
         phone: &Phone,
         packages: &[Vec<PackageRow>],
         nb_running_async_adb_commands: &mut u32,
         msg: Message,
-    ) -> Command<Message> {
+        selected_user: Option<User>,
+    ) -> iced::Command<Message> {
         match msg {
+            Message::ModalHide => {
+                self.modal = None;
+                iced::Command::none()
+            }
             Message::ExpertMode(toggled) => {
                 self.general.expert_mode = toggled;
                 debug!("Config change: {:?}", self);
                 Config::save_changes(self, &phone.adb_id);
-                Command::none()
+                iced::Command::none()
             }
             Message::DisableMode(toggled) => {
                 if phone.android_sdk >= 23 {
@@ -76,23 +94,23 @@ impl Settings {
                     debug!("Config change: {:?}", self);
                     Config::save_changes(self, &phone.adb_id);
                 }
-                Command::none()
+                iced::Command::none()
             }
             Message::MultiUserMode(toggled) => {
                 self.device.multi_user_mode = toggled;
                 debug!("Config change: {:?}", self);
                 Config::save_changes(self, &phone.adb_id);
-                Command::none()
+                iced::Command::none()
             }
             Message::ApplyTheme(theme) => {
                 self.general.theme = theme.to_string();
                 debug!("Config change: {:?}", self);
                 Config::save_changes(self, &phone.adb_id);
-                Command::none()
+                iced::Command::none()
             }
             Message::UrlPressed(url) => {
                 open_url(url);
-                Command::none()
+                iced::Command::none()
             }
             Message::LoadDeviceSettings => {
                 let backups =
@@ -102,7 +120,7 @@ impl Settings {
                     selected: backups.first().cloned(),
                     users: phone.user_list.clone(),
                     selected_user: phone.user_list.first().copied(),
-                    backup_state: String::new(),
+                    backup_state: String::default(),
                 };
                 match Config::load_configuration_file()
                     .devices
@@ -116,20 +134,20 @@ impl Settings {
                     None => {
                         self.device = DeviceSettings {
                             device_id: phone.adb_id.clone(),
-                            multi_user_mode: phone.android_sdk > 21,
+                            multi_user_mode: supports_multi_user(phone),
                             disable_mode: false,
                             backup,
                         }
                     }
                 };
-                Command::none()
+                iced::Command::none()
             }
             Message::BackupSelected(d_path) => {
                 self.device.backup.selected = Some(d_path.clone());
                 self.device.backup.users = list_available_backup_user(d_path);
-                Command::none()
+                iced::Command::none()
             }
-            Message::BackupDevice => Command::perform(
+            Message::BackupDevice => iced::Command::perform(
                 backup_phone(
                     phone.user_list.clone(),
                     self.device.device_id.clone(),
@@ -137,12 +155,20 @@ impl Settings {
                 ),
                 Message::DeviceBackedUp,
             ),
-            Message::DeviceBackedUp(_) => {
-                info!("[BACKUP] Backup successfully created");
-                self.device.backup.backups =
-                    list_available_backups(&self.general.backup_folder.join(phone.adb_id.clone()));
-                self.device.backup.selected = self.device.backup.backups.first().cloned();
-                Command::none()
+            Message::DeviceBackedUp(is_backed_up) => {
+                match is_backed_up {
+                    Ok(_) => {
+                        info!("[BACKUP] Backup successfully created");
+                        self.device.backup.backups = list_available_backups(
+                            &self.general.backup_folder.join(phone.adb_id.clone()),
+                        );
+                        self.device.backup.selected = self.device.backup.backups.first().cloned();
+                    }
+                    Err(err) => {
+                        error!("[BACKUP FAILED] Backup creation failed: {:?}", err);
+                    }
+                }
+                iced::Command::none()
             }
             Message::RestoreDevice => match restore_backup(phone, packages, &self.device) {
                 Ok(r_packages) => {
@@ -156,8 +182,13 @@ impl Settings {
                         };
                         for command in p.commands.clone() {
                             *nb_running_async_adb_commands += 1;
-                            commands.push(Command::perform(
-                                perform_adb_commands(
+                            commands.push(iced::Command::perform(
+                                // WARNING: THIS IS INSECURE!
+                                // If a user "A" restores a backup from a malicious user "B",
+                                // then B could run arbitrary high-privilege cmds,
+                                // on A's Android device!
+                                adb_shell_command(
+                                    phone.adb_id.clone(),
                                     command,
                                     CommandType::PackageManager(p_info.clone()),
                                 ),
@@ -166,7 +197,7 @@ impl Settings {
                         }
                     }
                     if r_packages.is_empty() {
-                        if get_android_sdk() == 0 {
+                        if get_android_sdk(&phone.adb_id) == 0 {
                             self.device.backup.backup_state = "Device is not connected".to_string();
                         } else {
                             self.device.backup.backup_state =
@@ -177,46 +208,59 @@ impl Settings {
                         "[RESTORE] Restoring backup {}",
                         self.device.backup.selected.as_ref().unwrap()
                     );
-                    Command::batch(commands)
+                    iced::Command::batch(commands)
                 }
                 Err(e) => {
-                    self.device.backup.backup_state = e.to_string();
+                    self.device.backup.backup_state.clone_from(&e);
                     error!("{} - {}", self.device.backup.selected.as_ref().unwrap(), e);
-                    Command::none()
+                    iced::Command::none()
                 }
             },
             // Trigger an action in mod.rs (Message::SettingsAction(msg))
-            Message::RestoringDevice(_) => Command::none(),
+            Message::RestoringDevice(_) => iced::Command::none(),
             Message::FolderChosen(result) => {
                 self.is_loading = false;
 
                 if let Ok(path) = result {
                     self.general.backup_folder = path;
                     Config::save_changes(self, &phone.adb_id);
-                    #[allow(unused_must_use)]
+                    #[expect(unused_must_use, reason = "side-effect")]
                     {
                         self.update(
                             phone,
                             packages,
                             nb_running_async_adb_commands,
                             Message::LoadDeviceSettings,
+                            selected_user,
                         );
                     }
                 }
-                Command::none()
+                iced::Command::none()
             }
             Message::ChooseBackUpFolder => {
                 if self.is_loading {
-                    Command::none()
+                    iced::Command::none()
                 } else {
                     self.is_loading = true;
-                    Command::perform(open_folder(), Message::FolderChosen)
+                    iced::Command::perform(open_folder(), Message::FolderChosen)
                 }
+            }
+            Message::ExportPackages => iced::Command::perform(
+                export_packages(selected_user.unwrap_or_default(), packages.to_vec()),
+                Message::PackagesExported,
+            ),
+            Message::PackagesExported(exported) => {
+                match exported {
+                    Ok(_) => self.modal = Some(PopUpModal::ExportUninstalled),
+                    Err(err) => error!("Failed to export list of uninstalled packages: {:?}", err),
+                }
+                iced::Command::none()
             }
         }
     }
 
-    pub fn view(&self, phone: &Phone) -> Element<Message, Theme, Renderer> {
+    #[allow(clippy::too_many_lines)]
+    pub fn view(&self, phone: &Phone, apps_view: &AppsView) -> Element<Message, Theme, Renderer> {
         let radio_btn_theme = Theme::ALL
             .iter()
             .fold(row![].spacing(10), |column, option| {
@@ -250,7 +294,7 @@ impl Settings {
         let choose_backup_descr = text("Note: If you have previous backups, you will need to transfer them manually to newly changed backup folder to be able to use Restore functionality")
             .style(style::Text::Commentary);
 
-        let choose_backup_btn = button(Text::new("\u{E930}").font(ICONS))
+        let choose_backup_btn = button(text("\u{E930}").font(ICONS))
             .padding([5, 10])
             .on_press(Message::ChooseBackUpFolder)
             .style(style::Button::Primary);
@@ -260,7 +304,7 @@ impl Settings {
             "Choose backup folder",
             Space::new(Length::Fill, Length::Shrink),
             "Current folder: ",
-            Text::new(self.general.backup_folder.to_string_lossy())
+            text(self.general.backup_folder.to_string_lossy())
         ]
         .spacing(10)
         .align_items(Alignment::Center);
@@ -408,6 +452,8 @@ impl Settings {
             ))
         };
 
+        let export_btn = button_primary("Export").on_press(Message::ExportPackages);
+
         let backup_row = row![
             backup_btn,
             "Backup the current state of the phone",
@@ -417,7 +463,9 @@ impl Settings {
         .spacing(10)
         .align_items(Alignment::Center);
 
-        let restore_row = if !self.device.backup.backups.is_empty() {
+        let restore_row = if self.device.backup.backups.is_empty() {
+            row![]
+        } else {
             row![
                 restore_btn(true),
                 "Restore the state of the device",
@@ -427,15 +475,7 @@ impl Settings {
             ]
             .spacing(10)
             .align_items(Alignment::Center)
-        } else {
-            row![]
         };
-
-        let backup_restore_ctn = container(column![backup_row, restore_row].spacing(10))
-            .padding(10)
-            .width(Length::Fill)
-            .height(Length::Shrink)
-            .style(style::Container::Frame);
 
         let no_device_ctn = || {
             container(text("No device detected").style(style::Text::Danger))
@@ -444,7 +484,7 @@ impl Settings {
                 .style(style::Container::BorderedFrame)
         };
 
-        let content = if phone.adb_id.clone().is_empty() {
+        let content = if phone.adb_id.is_empty() {
             column![
                 text("Theme").size(26),
                 theme_ctn,
@@ -458,6 +498,25 @@ impl Settings {
             .width(Length::Fill)
             .spacing(20)
         } else {
+            let export_row = row![
+                export_btn,
+                "Export uninstalled packages with their description",
+                Space::new(Length::Fill, Length::Shrink),
+                text(format!(
+                    "Selected: user {}",
+                    apps_view.selected_user.unwrap_or_default().id
+                )),
+            ]
+            .spacing(10)
+            .align_items(Alignment::Center);
+
+            let backup_restore_ctn =
+                container(column![backup_row, restore_row, export_row].spacing(10))
+                    .padding(10)
+                    .width(Length::Fill)
+                    .height(Length::Shrink)
+                    .style(style::Container::Frame);
+
             column![
                 text("Theme").size(26),
                 theme_ctn,
@@ -472,6 +531,42 @@ impl Settings {
             .width(Length::Fill)
             .spacing(20)
         };
+
+        if let Some(PopUpModal::ExportUninstalled) = self.modal {
+            let title = container(row![text("Success").size(24)].align_items(Alignment::Center))
+                .width(Length::Fill)
+                .style(style::Container::Frame)
+                .padding([10, 0, 10, 0])
+                .center_y()
+                .center_x();
+
+            let text_box = row![
+                text(format!("Exported uninstalled packages into file.\nFile is exported in same directory where {NAME} is located.")).width(Length::Fill),
+            ].padding(20);
+
+            let file_row = row![
+                text(generate_backup_name(chrono::Local::now())).style(style::Text::Commentary)
+            ]
+            .padding(20);
+
+            let modal_btn_row = row![
+                Space::new(Length::Fill, Length::Shrink),
+                button(text("Close").width(Length::Shrink))
+                    .width(Length::Shrink)
+                    .on_press(Message::ModalHide),
+                Space::new(Length::Fill, Length::Shrink),
+            ];
+
+            let ctn = container(column![title, text_box, file_row, modal_btn_row])
+                .height(Length::Shrink)
+                .width(500)
+                .padding(10)
+                .style(style::Container::Frame);
+
+            return Modal::new(content.padding(10), ctn)
+                .on_blur(Message::ModalHide)
+                .into();
+        }
 
         container(scrollable(content))
             .padding(10)
