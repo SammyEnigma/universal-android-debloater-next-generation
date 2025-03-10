@@ -1,12 +1,12 @@
-use crate::core::sync::{get_android_sdk, User};
-use crate::core::utils::DisplayablePath;
-use crate::gui::views::settings::Settings;
 use crate::CACHE_DIR;
 use crate::CONFIG_DIR;
+use crate::core::utils::DisplayablePath;
+use crate::core::{sync::User, theme::Theme};
+use crate::gui::views::settings::Settings;
 use serde::{Deserialize, Serialize};
-use static_init::dynamic;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -31,8 +31,9 @@ pub struct BackupSettings {
     pub backup_state: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct DeviceSettings {
+    /// Unique serial identifier
     pub device_id: String,
     pub disable_mode: bool,
     pub multi_user_mode: bool,
@@ -43,26 +44,14 @@ pub struct DeviceSettings {
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
-            theme: String::from("Dark"),
+            theme: Theme::default().to_string(),
             expert_mode: false,
             backup_folder: CACHE_DIR.join("backups"),
         }
     }
 }
 
-impl Default for DeviceSettings {
-    fn default() -> Self {
-        Self {
-            device_id: String::new(),
-            multi_user_mode: get_android_sdk() > 21,
-            disable_mode: false,
-            backup: BackupSettings::default(),
-        }
-    }
-}
-
-#[dynamic]
-static CONFIG_FILE: PathBuf = CONFIG_DIR.join("config.toml");
+static CONFIG_FILE: LazyLock<PathBuf> = LazyLock::new(|| CONFIG_DIR.join("config.toml"));
 
 impl Config {
     pub fn save_changes(settings: &Settings, device_id: &String) {
@@ -72,7 +61,7 @@ impl Config {
             .iter_mut()
             .find(|x| x.device_id == *device_id)
         {
-            *device = settings.device.clone();
+            device.clone_from(&settings.device);
         } else {
             debug!("config: New device settings saved");
             config.devices.push(settings.device.clone());
@@ -94,5 +83,59 @@ impl Config {
         let toml = toml::to_string(&Self::default()).unwrap();
         fs::write(&*CONFIG_FILE, toml).expect("Could not write config file to disk!");
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests
+
+    use super::*;
+    use std::path::Path;
+
+    // create a clean default config file for testing
+    fn create_default_config_file() {
+        let toml = toml::to_string(&Config::default()).unwrap();
+        fs::write(&*CONFIG_FILE, toml).expect("Could not write config file to disk!");
+    }
+
+    #[test]
+    fn test_create_default_config_file() {
+        create_default_config_file();
+        assert!(CONFIG_FILE.exists());
+    }
+
+    #[test]
+    fn test_load_configuration_file() {
+        create_default_config_file();
+        let config = Config::load_configuration_file();
+        assert_eq!(config.devices.len(), 0);
+        assert_eq!(config.general.theme, Theme::default().to_string());
+        assert!(!config.general.expert_mode);
+        assert_eq!(config.general.backup_folder, CACHE_DIR.join("backups"));
+    }
+
+    #[test]
+    fn test_save_changes() {
+        let mut settings = Settings::default();
+        let device_id = "test_device".to_string();
+        settings.device.device_id = device_id.clone();
+        Config::save_changes(&settings, &device_id);
+        let config = Config::load_configuration_file();
+        assert_eq!(config.devices[0].device_id, device_id);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert_eq!(config.devices.len(), 0);
+        assert_eq!(config.general.theme, Theme::default().to_string());
+        assert!(!config.general.expert_mode);
+        assert_eq!(config.general.backup_folder, CACHE_DIR.join("backups"));
+    }
+
+    #[test]
+    fn test_config_file_path() {
+        assert_eq!(&*CONFIG_FILE, Path::new(&*CONFIG_DIR.join("config.toml")));
     }
 }

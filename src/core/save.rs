@@ -1,34 +1,31 @@
 use crate::core::config::{Config, DeviceSettings};
-use crate::core::sync::{apply_pkg_state_commands, CorePackage, Phone, User};
+use crate::core::sync::{CorePackage, Phone, User, apply_pkg_state_commands};
 use crate::core::utils::DisplayablePath;
 use crate::gui::widgets::package_row::PackageRow;
-use crate::CACHE_DIR;
 use serde::{Deserialize, Serialize};
-use static_init::dynamic;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-#[dynamic]
-pub static BACKUP_DIR: PathBuf = CACHE_DIR.join("backups");
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-struct PhoneBackup {
-    device_id: String,
-    users: Vec<UserBackup>,
+pub struct PhoneBackup {
+    pub device_id: String,
+    pub users: Vec<UserBackup>,
 }
 
 #[derive(Default, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-struct UserBackup {
-    id: u16,
-    packages: Vec<CorePackage>,
+pub struct UserBackup {
+    pub id: u16,
+    pub packages: Vec<CorePackage>,
 }
 
-// Backup all `Uninstalled` and `Disabled` packages
+/// Backup all `Uninstalled` and `Disabled` packages
 pub async fn backup_phone(
     users: Vec<User>,
     device_id: String,
     phone_packages: Vec<Vec<PackageRow>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut backup = PhoneBackup {
         device_id: device_id.clone(),
         ..PhoneBackup::default()
@@ -63,7 +60,7 @@ pub async fn backup_phone(
                 format!("{}.json", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
 
             match fs::write(backup_path.join(backup_filename), json) {
-                Ok(_) => Ok(()),
+                Ok(()) => Ok(true),
                 Err(err) => Err(err.to_string()),
             }
         }
@@ -72,10 +69,9 @@ pub async fn backup_phone(
 }
 
 pub fn list_available_backups(dir: &Path) -> Vec<DisplayablePath> {
-    #[allow(clippy::option_if_let_else)]
     match fs::read_dir(dir) {
         Ok(files) => files
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .map(|e| DisplayablePath { path: e.path() })
             .collect::<Vec<_>>(),
         Err(_) => vec![],
@@ -137,23 +133,22 @@ pub fn restore_backup(
                 };
 
                 for (i, backup_package) in u.packages.iter().enumerate() {
-                    let package: CorePackage;
-                    match packages[index]
+                    let package: CorePackage = match packages[index]
                         .iter()
                         .find(|x| x.name == backup_package.name)
                     {
-                        Some(p) => package = p.into(),
+                        Some(p) => p.into(),
                         None => {
                             return Err(format!(
                                 "{} not found for user {}",
                                 backup_package.name, u.id
-                            ))
+                            ));
                         }
-                    }
+                    };
                     let p_commands = apply_pkg_state_commands(
                         &package,
                         backup_package.state,
-                        &settings
+                        settings
                             .backup
                             .selected_user
                             .ok_or("field should be Some type")?,
